@@ -1,636 +1,530 @@
-import json
 import logging
 import queue
+import threading
 import time
-from collections import deque
-from copy import deepcopy
-from datetime import datetime, timezone
-from typing import Any, Deque, Dict, Iterable, List, Optional, Set
+import uuid
+from collections import OrderedDict, defaultdict, deque
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("event_aggregator")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "interruption": {
-        "threshold_employee_interrupt": 0.5,
-        "T_resume_interrupt_sec": 60.0,
-        "min_action_duration_for_interrupt_sec": 0.8,
-    },
-    "zone_exit": {
-        "T_left_confirm_sec": 1.2,
-        "handoff_confirm_window_sec": 2.0,
-        "T_handoff_confirm_sec": 0.6,
-    },
-    "intrusion": {
-        "T_intrusion_confirm_sec": 2.0,
-    },
-    "scoring": {
-        "w_left_zone": 10,
-        "w_carrying_tool": 25,
-        "w_carrying_food": 25,
-        "w_intrusion": 20,
-        "level_info_lt": 25,
-        "level_warning_lt": 45,
-        "employee_confidence_floor": 0.5,
-    },
+    "threshold_employee_interrupt": 0.5,
+    "T_resume_interrupt_sec": 60.0,
+    "min_action_duration_for_interrupt_sec": 0.8,
+    "handoff_confirm_window_sec": 2.0,
+    "risk_hold_margin_sec": 1.0,
+    "emit_zero_risk_score": True,
+    "w_left_zone": 10,
+    "w_carrying_tool": 25,
+    "w_carrying_food": 25,
+    "w_intrusion": 20,
+    "level_info_lt": 25,
+    "level_warning_lt": 45,
+    "employee_confidence_floor": 0.5,
+    "T_violation_dedup_sec": 30.0,
+    "clip_for_sanitary_violation": True,
+    "clip_for_process_event": False,
+    "clip_for_data_quality_obs_lost": False,
+    "idempotency_cache_size": 10000,
+    "state_ttl_sec": 300.0,
+    "restaurant_id": None,
+}
+
+SEVERITY_MAP = {
+    "critical": "violation", "high": "violation", "violation": "violation",
+    "medium": "warning", "low": "warning", "warning": "warning", "info": "info",
+}
+SEVERITY_CAPPED = {"critical", "high", "violation"}
+ESCALATIONS = {
+    "alcohol_consumption_in_work_zone": "alcohol_escalation",
+    "smoking_in_work_zone": "smoking_escalation",
+}
+UNESTABLISHED = {"anonymous_track", "unresolved"}
+FINAL_DECISIONS = {
+    "SANITARY_VIOLATION_CONFIRMED", "PROCESS_EVENT_CONFIRMED", "DATA_QUALITY_EVENT_CONFIRMED",
+    "UNRESOLVED_DUE_TO_DATA_QUALITY", "NO_EVENT",
+}
+PROCESS_TYPES = {
+    "food_handoff": "food_handoff",
+    "action_interruption": "ACTION_INTERRUPTION",
+    "zone_risk_score": "ZONE_RISK_SCORE",
+}
+PASSTHROUGH = {
+    "hygiene_check": "HYGIENE_CHECK",
+    "environment_state": "ENVIRONMENT_STATE",
+    "audit_clip": "AUDIT_CLIP",
+}
+ID_FIELD = {
+    "ACTION_EVENT": "action_id",
+    "HYGIENE_CHECK": "hygiene_check_id",
+    "SANITARY_EVENT": "sanitary_event_id",
+    "PROCESS_EVENT": "process_event_id",
+    "DATA_QUALITY_EVENT": "data_quality_event_id",
+    "ENVIRONMENT_STATE": "environment_state_id",
+    "AUDIT_CLIP": "audit_clip_id",
 }
 
 
-class EventAggregator:
-    """
-    Склеивает результаты Action / Sanitary, держит state по action_id,
-    обеспечивает идемпотентность, детектит ACTION_INTERRUPTION, считает ZONE_RISK_SCORE
-    и отправляет финальные события в DBI.
+def _ms(value) -> int:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return int(time.time() * 1000)
+    return int(v if v > 1e12 else v * 1000)
 
-    Ожидаемые входы:
-    1) ACTION_START / ACTION_END из action_detector
-    2) пакет с sanitary_events (как сейчас делает sanitary_checker)
-    3) standalone sanitary event / hygiene event, если модули будут вызывать агрегатор отдельно
 
-    Важный момент:
-    delayed sanitary-события, которые приходят ПОСЛЕ ACTION_END, должны содержать action_id.
-    Иначе корректно склеить их с конкретным действием невозможно.
-    """
+def _float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    def __init__(
-        self,
-        config: Optional[Dict[str, Any]] = None,
-        dedup_cache_size: int = 10000,
-        finished_action_ttl_sec: float = 300.0,
-    ):
-        self.config = self._deep_merge(deepcopy(DEFAULT_CONFIG), config or {})
-        self.finished_action_ttl_sec = float(finished_action_ttl_sec)
 
-        self._seen_event_keys: Set[str] = set()
-        self._seen_event_queue: Deque[str] = deque(maxlen=max(1000, int(dedup_cache_size)))
+def _clamp(value: float) -> float:
+    return min(1.0, max(0.0, value))
 
-        self.actions: Dict[str, Dict[str, Any]] = {}
-        self.finished_actions: Dict[str, Dict[str, Any]] = {}
-        self.pending_left_zone_actions: List[Dict[str, Any]] = []
 
-    # ==========================================================
-    # ======================= PUBLIC API ========================
-    # ==========================================================
-    def process(self, packet: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Главная точка входа.
-        Возвращает список новых агрегированных событий, которые также отправляются в DBI.
-        """
-        self._cleanup_old_state()
+def _employee(value) -> Optional[str]:
+    return None if value in (None, "", "undefined") else str(value)
 
-        out_events: List[Dict[str, Any]] = []
 
-        if not isinstance(packet, dict):
-            return out_events
+def _employee_of(event: Dict, payload: Dict) -> Optional[str]:
+    value = payload.get("employee_id")
+    if value in (None, "", "undefined") and event.get("entity_type") == "employee":
+        value = event.get("entity_id")
+    return _employee(value)
 
-        event_type = packet.get("event_type")
 
-        if event_type == "ACTION_START":
-            produced = self._handle_action_start(packet)
-            out_events.extend(self._emit_many(produced))
+def _compact(data: Dict) -> Dict:
+    return {k: v for k, v in data.items() if v is not None}
 
-        elif event_type == "ACTION_END":
-            sanitary_events = packet.get("sanitary_events") or []
-            inline_events_for_emit: List[Dict[str, Any]] = []
-            if sanitary_events:
-                inline_events_for_emit = self._normalize_inline_sanitary_events(
-                    packet,
-                    sanitary_events,
-                    emit_mode=False,
-                )
 
-            produced = self._handle_action_end(packet)
-            out_events.extend(self._emit_many(produced))
-            out_events.extend(self._emit_many(inline_events_for_emit))
+def _same_place(zone_a, cam_a, zone_b, cam_b) -> bool:
+    return (zone_a is not None and zone_a == zone_b) or (cam_a is not None and cam_a == cam_b)
 
-        elif event_type == "HYGIENE_EVENT":
-            produced = self._handle_hygiene_event(packet)
-            out_events.extend(self._emit_many(produced))
 
-        elif event_type == "SANITARY_EVENT":
-            produced = self._handle_sanitary_event(packet)
-            out_events.extend(self._emit_many(produced))
+class EventAggregator(threading.Thread):
+    def __init__(self, input_queue: queue.Queue, out_queue: queue.Queue,
+                 config: Optional[Dict[str, Any]] = None):
+        super().__init__(daemon=True)
+        self.stop_event = threading.Event()
+        self.stats: Dict[str, int] = defaultdict(int)
+        self.cfg = {**DEFAULT_CONFIG, **(config or {})}
+        self._in = input_queue
+        self._out = out_queue
 
-        # Поддержка текущего интерфейса sanitary_checker:
-        # он не делает отдельные эвенты, а прикладывает sanitary_events к packet.
-        sanitary_events = packet.get("sanitary_events") or []
-        if sanitary_events and event_type != "ACTION_END":
-            normalized_events = self._normalize_inline_sanitary_events(packet, sanitary_events)
-            out_events.extend(self._emit_many(normalized_events))
+        self._seen: OrderedDict = OrderedDict()
+        self._actions: Dict[str, Dict[str, Any]] = {}
+        self._left_zone: Dict[tuple, Dict[str, Any]] = {}
+        self._violation_last: Dict[tuple, int] = {}
+        self._intrusions: deque = deque()
+        self._pending_risk: List[Dict[str, Any]] = []
+        self._last_gc = time.monotonic()
 
-        return out_events
+        self._handlers = {
+            "action_start": self._on_action_start,
+            "action_end": self._on_action_end,
+            "sanitary_event": self._on_sanitary,
+            "process_event": self._on_process,
+            "data_quality_event": self._on_data_quality,
+            **{name: self._on_passthrough for name in PASSTHROUGH},
+        }
 
-    def flush_action(self, action_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Возвращает текущий snapshot action state, если нужен отладочный доступ.
-        """
-        state = self.actions.get(action_id) or self.finished_actions.get(action_id)
-        return deepcopy(state) if state else None
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                event = self._in.get(timeout=0.25)
+            except queue.Empty:
+                event = None
+            try:
+                payloads = self.process(event)
+            except Exception:
+                logger.exception("event_aggregator: processing failed")
+                continue
+            self._emit(payloads)
 
-    # ==========================================================
-    # ====================== ACTION START =======================
-    # ==========================================================
-    def _handle_action_start(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
-        action_id = event.get("action_id")
-        if not action_id:
-            return []
+    def stop(self):
+        self.stop_event.set()
 
-        state = self.actions.get(action_id, self._new_action_state(action_id))
-        state["action_start"] = deepcopy(event)
-        state["employee_id"] = event.get("employee_id")
-        state["zone_id"] = event.get("zone_id")
-        state["camera_id"] = event.get("camera_id")
-        state["action_type"] = event.get("action_type")
-        state["timestamp_start"] = event.get("timestamp_start")
-        state["updated_at_monotonic"] = time.time()
-
-        if event.get("hygiene") is not None:
-            state["hygiene"] = deepcopy(event["hygiene"])
-
-        self.actions[action_id] = state
-
-        produced: List[Dict[str, Any]] = [deepcopy(event)]
-
-        interruption_event = self._detect_interruption_for_start(state, event)
-        if interruption_event is not None:
-            produced.append(interruption_event)
-
-        return produced
-
-    # ==========================================================
-    # ======================= ACTION END ========================
-    # ==========================================================
-    def _handle_action_end(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
-        action_id = event.get("action_id")
-        if not action_id:
-            return []
-
-        state = self.actions.get(action_id, self._new_action_state(action_id))
-        state["action_end"] = deepcopy(event)
-        state["employee_id"] = event.get("employee_id", state.get("employee_id"))
-        state["zone_id"] = event.get("zone_id", state.get("zone_id"))
-        state["camera_id"] = event.get("camera_id", state.get("camera_id"))
-        state["action_type"] = event.get("action_type", state.get("action_type"))
-        state["timestamp_start"] = event.get("timestamp_start", state.get("timestamp_start"))
-        state["timestamp_end"] = event.get("timestamp_end")
-        state["end_reason"] = event.get("end_reason")
-        state["employee_confidence"] = float(event.get("employee_confidence", state.get("employee_confidence", 0.0)) or 0.0)
-        state["carrying_tool"] = bool(event.get("carrying_tool", False))
-        state["carrying_food"] = bool(event.get("carrying_food", False))
-        state["updated_at_monotonic"] = time.time()
-
-        if event.get("hygiene") is not None:
-            state["hygiene"] = deepcopy(event["hygiene"])
-
-        self.actions[action_id] = state
-
-        produced: List[Dict[str, Any]] = [deepcopy(event)]
-
-        risk_event = self._make_zone_risk_score_event(state)
-        if risk_event is not None:
-            produced.append(risk_event)
-            state["risk_score_event"] = deepcopy(risk_event)
-
-        self._mark_finished(action_id)
-        self._remember_left_zone_candidate(state)
-
-        return produced
-
-    # ==========================================================
-    # =================== HYGIENE / SANITARY ====================
-    # ==========================================================
-    def _handle_hygiene_event(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
-        action_id = event.get("action_id")
-        if not action_id:
-            return [deepcopy(event)]
-
-        state = self.actions.get(action_id) or self.finished_actions.get(action_id)
-        if state is None:
-            state = self._new_action_state(action_id)
-            self.actions[action_id] = state
-
-        state.setdefault("hygiene_events", []).append(deepcopy(event))
-        state["updated_at_monotonic"] = time.time()
-        return [deepcopy(event)]
-
-    def _handle_sanitary_event(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
-        action_id = event.get("action_id")
-        if not action_id:
-            return [deepcopy(event)]
-
-        state = self.actions.get(action_id) or self.finished_actions.get(action_id)
-        if state is None:
-            state = self._new_action_state(action_id)
-            self.actions[action_id] = state
-
-        state.setdefault("sanitary_events", []).append(deepcopy(event))
-        state["updated_at_monotonic"] = time.time()
-
-        produced = [deepcopy(event)]
-
-        # если поздний sanitary event изменил факторы риска — пересчитываем score
-        if self._sanitary_event_affects_risk(event):
-            risk_event = self._make_zone_risk_score_event(state)
-            if risk_event is not None:
-                produced.append(risk_event)
-                state["risk_score_event"] = deepcopy(risk_event)
-
-        return produced
-
-    def _normalize_inline_sanitary_events(
-        self,
-        packet: Dict[str, Any],
-        sanitary_events: Iterable[Dict[str, Any]],
-        emit_mode: bool = True,
-    ) -> List[Dict[str, Any]]:
-        action_id = packet.get("action_id")
-        normalized: List[Dict[str, Any]] = []
-
-        for raw in sanitary_events:
-            code = raw.get("code")
-            raw_type = raw.get("type")
-            event_type = "SANITARY_EVENT"
-            if raw_type == "PROCESS_EVENT":
-                event_type = "SANITARY_EVENT"
-            elif raw_type == "DATA_QUALITY_EVENT":
-                event_type = "SANITARY_EVENT"
-            elif raw_type == "SANITARY_VIOLATION":
-                event_type = "SANITARY_EVENT"
-
-            event = {
-                "event_type": event_type,
-                "action_id": raw.get("action_id", action_id),
-                "camera_id": raw.get("camera_id", packet.get("camera_id")),
-                "zone_id": raw.get("zone_id", packet.get("zone_id")),
-                "employee_id": raw.get("employee_id", packet.get("employee_id")),
-                "action_type": raw.get("action_type", packet.get("action_type")),
-                "timestamp": raw.get("timestamp", self._now_iso()),
-                "sanitary_type": raw_type,
-                "sanitary_code": code,
-                "payload": deepcopy(raw),
-            }
-            if emit_mode:
-                normalized.extend(self._handle_sanitary_event(event))
+    def process(self, event: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if event is not None:
+            handler = self._handlers.get(str(event.get("event_type", "")).lower())
+            if handler is None:
+                self.stats["ignored"] += 1
             else:
-                action_id = event.get("action_id")
-                if action_id:
-                    state = self.actions.get(action_id) or self.finished_actions.get(action_id)
-                    if state is None:
-                        state = self._new_action_state(action_id)
-                        self.actions[action_id] = state
-                    state.setdefault("sanitary_events", []).append(deepcopy(event))
-                    state["updated_at_monotonic"] = time.time()
-                normalized.append(event)
+                out += handler(event)
+        return out + self.tick()
 
-        return normalized
+    def tick(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        now = time.monotonic() if now is None else now
+        due = [e for e in self._pending_risk if e["due"] <= now]
+        self._pending_risk = [e for e in self._pending_risk if e["due"] > now]
+        out: List[Dict[str, Any]] = []
+        for entry in due:
+            out += self._risk_event(entry)
+        self._gc(now)
+        return out
 
-    # ==========================================================
-    # ================= INTERRUPTION DETECTION ==================
-    # ==========================================================
-    def _detect_interruption_for_start(
-        self,
-        current_state: Dict[str, Any],
-        action_start_event: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        cfg = self.config["interruption"]
-        current_employee_id = action_start_event.get("employee_id")
-        current_zone_id = action_start_event.get("zone_id")
-        current_action_type = action_start_event.get("action_type")
+    def _emit(self, payloads: List[Dict[str, Any]]):
+        for payload in payloads:
+            try:
+                self._out.put_nowait(payload)
+            except queue.Full:
+                self.stats["dropped_out_queue_full"] += 1
+                logger.error("gateway queue is full, %s dropped", payload.get("event_type"))
 
-        if current_employee_id in (None, "undefined"):
-            return None
+    def _ship(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        out_type = payload["event_type"]
+        key = f"{out_type}:{payload[ID_FIELD[out_type]]}"
+        if key in self._seen:
+            self.stats["suppressed_duplicate"] += 1
+            return []
+        self._seen[key] = None
+        while len(self._seen) > self.cfg["idempotency_cache_size"]:
+            self._seen.popitem(last=False)
+        payload = _compact(payload)
+        if self.cfg["restaurant_id"] is not None:
+            payload.setdefault("restaurant_id", self.cfg["restaurant_id"])
+        self.stats[f"shipped_{out_type}"] += 1
+        return [payload]
 
-        current_start_ts = self._coerce_ts(action_start_event.get("timestamp_start"))
-        if current_start_ts is None:
-            return None
+    def _clip(self, event: Dict, link_field: str, link_id: str) -> List[Dict[str, Any]]:
+        clip_id = event.get("audit_clip_id")
+        if not clip_id:
+            return []
+        return self._ship({
+            "event_type": "AUDIT_CLIP",
+            "audit_clip_id": clip_id,
+            link_field: link_id,
+            "camera_id": event.get("camera_id"),
+            "timestamp": _ms(event.get("timestamp")),
+        })
 
-        best_candidate = None
-        best_gap = None
+    @staticmethod
+    def _provenance(event: Dict) -> Dict[str, Any]:
+        keys = ("track_lineage_id", "executor_attribution", "rules_config_version",
+                "model_versions", "decision_trace", "time_source", "late")
+        return {k: event[k] for k in keys if event.get(k) is not None}
 
-        for candidate in self.pending_left_zone_actions:
-            if candidate.get("employee_id") != current_employee_id:
-                continue
-            if candidate.get("zone_id") != current_zone_id:
-                continue
-            if candidate.get("action_type") != current_action_type:
-                continue
-            if float(candidate.get("employee_confidence", 0.0)) < float(cfg["threshold_employee_interrupt"]):
-                continue
-            if float(candidate.get("duration_sec", 0.0)) < float(cfg["min_action_duration_for_interrupt_sec"]):
-                continue
+    @staticmethod
+    def _obs_state(event: Dict, payload: Dict) -> str:
+        trace = event.get("decision_trace") or {}
+        return str(payload.get("observation_state") or trace.get("observation_state") or "obs_ok").upper()
 
-            prev_end_ts = self._coerce_ts(candidate.get("timestamp_end"))
-            if prev_end_ts is None:
-                continue
+    @staticmethod
+    def _decision(payload: Dict, default: str = "") -> str:
+        return str(payload.get("decision_mode") or default).upper()
 
-            gap = current_start_ts - prev_end_ts
-            if gap < 0:
-                continue
-            if gap > float(cfg["T_resume_interrupt_sec"]):
-                continue
+    def _suppress(self, event: Dict, decision: str):
+        self.stats[f"suppressed_{decision.lower() or 'missing'}"] += 1
+        if decision not in FINAL_DECISIONS:
+            logger.warning("%s %s dropped: decision_mode '%s' is not final",
+                           event.get("event_type"), event.get("event_id"), decision)
 
-            if best_gap is None or gap < best_gap:
-                best_candidate = candidate
-                best_gap = gap
+    def _unestablished(self, confidence, attribution) -> bool:
+        if attribution in UNESTABLISHED:
+            return True
+        return confidence is not None and _float(confidence, 1.0) < self.cfg["employee_confidence_floor"]
 
-        if best_candidate is None:
-            return None
-
-        self.pending_left_zone_actions = [
-            item for item in self.pending_left_zone_actions
-            if item.get("action_id") != best_candidate.get("action_id")
-        ]
-
+    @staticmethod
+    def _process_payload(ptype: str, employee_id, zone_id, camera_id, ts: int,
+                         details: Dict, raw: Optional[Dict] = None) -> Dict[str, Any]:
         return {
-            "event_type": "ACTION_INTERRUPTION",
-            "employee_id": current_employee_id,
-            "zone_id": current_zone_id,
-            "action_type": current_action_type,
-            "interrupted_action_id": best_candidate["action_id"],
-            "resumed_action_id": current_state["action_id"],
-            "resume_gap_sec": round(best_gap, 3),
+            "event_type": "PROCESS_EVENT",
+            "process_event_id": str(uuid.uuid4()),
+            "process_event_type": ptype,
+            "employee_id": employee_id,
+            "zone_id": zone_id,
+            "camera_id": camera_id,
+            "timestamp": ts,
+            "details": details,
+            "raw_payload": raw,
         }
 
-    def _remember_left_zone_candidate(self, state: Dict[str, Any]) -> None:
-        if state.get("end_reason") != "left_zone":
-            return
+    def _on_action_start(self, event: Dict) -> List[Dict[str, Any]]:
+        p = event.get("payload") or {}
+        state = {
+            "ts_start": _ms(event.get("timestamp")),
+            "employee_id": _employee_of(event, p),
+            "zone_id": p.get("zone_id"),
+            "camera_id": event.get("camera_id"),
+            "action_type": p.get("action_type"),
+            "object_class": p.get("object_class"),
+            "seen": time.monotonic(),
+        }
+        if p.get("action_id"):
+            self._actions[p["action_id"]] = state
+        return self._detect_interruption(state, p.get("action_id"))
 
-        action_id = state.get("action_id")
-        if not action_id:
-            return
+    def _detect_interruption(self, state: Dict, resumed_id: Optional[str]) -> List[Dict[str, Any]]:
+        employee_id = state["employee_id"]
+        key = (employee_id, state["zone_id"], state["action_type"])
+        prev = self._left_zone.get(key) if employee_id else None
+        if prev is None:
+            return []
+        gap = (state["ts_start"] - prev["ts_end"]) / 1000.0
+        if gap < 0 or gap > self.cfg["T_resume_interrupt_sec"]:
+            return []
+        if (prev["employee_confidence"] < self.cfg["threshold_employee_interrupt"]
+                or prev["duration"] < self.cfg["min_action_duration_for_interrupt_sec"]):
+            return []
+        del self._left_zone[key]
+        return self._ship(self._process_payload(
+            "ACTION_INTERRUPTION", employee_id, state["zone_id"], state["camera_id"], state["ts_start"],
+            {
+                "interrupted_action_id": prev["action_id"],
+                "resumed_action_id": resumed_id,
+                "action_type": state["action_type"],
+                "resume_gap_sec": round(gap, 3),
+            },
+        ))
 
-        candidate = {
+    def _on_action_end(self, event: Dict) -> List[Dict[str, Any]]:
+        p = event.get("payload") or {}
+        action_id = p.get("action_id") or event.get("event_id") or str(uuid.uuid4())
+        start = self._actions.pop(action_id, {})
+        ts_end = _ms(event.get("timestamp"))
+        ts_start = start.get("ts_start")
+        employee_id = _employee_of(event, p)
+        employee_confidence = _clamp(_float(p.get("employee_confidence"), _float(event.get("confidence"))))
+        duration = max(0.0, _float(p.get("duration"), (ts_end - ts_start) / 1000.0 if ts_start else 0.0))
+
+        payload = {
+            "event_type": "ACTION_EVENT",
             "action_id": action_id,
-            "employee_id": state.get("employee_id"),
-            "zone_id": state.get("zone_id"),
-            "action_type": state.get("action_type"),
-            "employee_confidence": float(state.get("employee_confidence", 0.0) or 0.0),
-            "timestamp_end": state.get("timestamp_end"),
-            "duration_sec": float(self._compute_duration_sec(state) or 0.0),
-            "saved_at_monotonic": time.time(),
+            "employee_id": employee_id,
+            "camera_id": event.get("camera_id") or p.get("camera_id"),
+            "zone_id": p.get("zone_id") or start.get("zone_id"),
+            "action_type": p.get("action_type") or start.get("action_type"),
+            "object_class": p.get("object_class") or start.get("object_class"),
+            "timestamp_start": ts_start,
+            "timestamp_end": ts_end,
+            "duration": round(duration, 3),
+            "end_reason": p.get("end_reason"),
+            "employee_confidence": employee_confidence,
+            "carrying_type": p.get("carrying_type") or "none",
+            "carrying_confidence": _clamp(_float(p.get("carrying_confidence"), employee_confidence)),
+            "confidence": _clamp(_float(event.get("confidence"), employee_confidence)),
+            "raw_payload": self._provenance(event),
         }
+        out = self._ship(payload)
+        if not out:
+            return out
+        if payload["end_reason"] == "left_zone" and employee_id:
+            self._left_zone[(employee_id, payload["zone_id"], payload["action_type"])] = {
+                "action_id": action_id,
+                "ts_end": ts_end,
+                "duration": duration,
+                "employee_confidence": employee_confidence,
+                "seen": time.monotonic(),
+            }
+        self._open_risk(event, payload, ts_start or ts_end)
+        return out
 
-        self.pending_left_zone_actions = [
-            item for item in self.pending_left_zone_actions
-            if item.get("action_id") != action_id
-        ]
-        self.pending_left_zone_actions.append(candidate)
+    def _open_risk(self, event: Dict, action: Dict, ts_from: int):
+        self._pending_risk.append({
+            "action_id": action["action_id"],
+            "employee_id": action["employee_id"],
+            "employee_confidence": action["employee_confidence"],
+            "zone_id": action["zone_id"],
+            "camera_id": action["camera_id"],
+            "lineage": event.get("track_lineage_id"),
+            "attribution": event.get("executor_attribution"),
+            "end_reason": action["end_reason"],
+            "carrying_type": action["carrying_type"],
+            "ts": action["timestamp_end"],
+            "ts_from": ts_from,
+            "handoff": False,
+            "intrusion": any(
+                ts >= ts_from and _same_place(zone, cam, action["zone_id"], action["camera_id"])
+                for ts, zone, cam in self._intrusions
+            ),
+            "due": time.monotonic() + self.cfg["handoff_confirm_window_sec"] + self.cfg["risk_hold_margin_sec"],
+        })
 
-    # ==========================================================
-    # ===================== RISK SCORING ========================
-    # ==========================================================
-    def _make_zone_risk_score_event(self, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        action_id = state.get("action_id")
-        if not action_id:
-            return None
-
-        action_end = state.get("action_end")
-        if not action_end:
-            return None
-
-        scoring = self.config["scoring"]
-
-        handoff_food = self._has_sanitary_code(state, "food_handoff")
-        intrusion_detected = self._has_sanitary_code(state, "intrusion_work_zone")
-
+    def _risk_event(self, entry: Dict) -> List[Dict[str, Any]]:
+        cfg = self.cfg
         factors = {
-            "left_zone": 0,
-            "carrying_tool": 0,
-            "carrying_food": 0,
-            "intrusion": 0,
+            "left_zone": cfg["w_left_zone"] if entry["end_reason"] == "left_zone" else 0,
+            "carrying_tool": cfg["w_carrying_tool"] if entry["carrying_type"] == "tool" else 0,
+            "carrying_food": cfg["w_carrying_food"] if entry["carrying_type"] == "food" and not entry["handoff"] else 0,
+            "intrusion": cfg["w_intrusion"] if entry["intrusion"] else 0,
         }
-
-        if state.get("end_reason") == "left_zone":
-            factors["left_zone"] = int(scoring["w_left_zone"])
-
-        if bool(state.get("carrying_tool", False)):
-            factors["carrying_tool"] = int(scoring["w_carrying_tool"])
-
-        if bool(state.get("carrying_food", False)):
-            factors["carrying_food"] = 0 if handoff_food else int(scoring["w_carrying_food"])
-
-        if intrusion_detected:
-            factors["intrusion"] = int(scoring["w_intrusion"])
-
         score = sum(factors.values())
-        level = self._score_to_level(score)
-
-        employee_confidence = float(state.get("employee_confidence", 0.0) or 0.0)
-        if employee_confidence < float(scoring["employee_confidence_floor"]):
-            if level == "violation":
-                level = "warning"
-
-        return {
-            "event_type": "ZONE_RISK_SCORE",
-            "action_id": action_id,
-            "employee_id": state.get("employee_id"),
-            "zone_id": state.get("zone_id"),
-            "action_type": state.get("action_type"),
-            "score": score,
-            "level": level,
-            "factors": factors,
-        }
-
-    def _score_to_level(self, score: int) -> str:
-        scoring = self.config["scoring"]
-        if score < int(scoring["level_info_lt"]):
-            return "info"
-        if score < int(scoring["level_warning_lt"]):
-            return "warning"
-        return "violation"
-
-    # ==========================================================
-    # ===================== IDEMPOTENCY =========================
-    # ==========================================================
-    def _emit_many(self, events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        emitted: List[Dict[str, Any]] = []
-        for event in events:
-            emitted_event = self._emit_one(event)
-            if emitted_event is not None:
-                emitted.append(emitted_event)
-        return emitted
-
-    def _emit_one(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        key = self._make_idempotency_key(event)
-        if key in self._seen_event_keys:
-            return None
-
-        if len(self._seen_event_queue) == self._seen_event_queue.maxlen:
-            oldest = self._seen_event_queue.popleft()
-            self._seen_event_keys.discard(oldest)
-
-        self._seen_event_queue.append(key)
-        self._seen_event_keys.add(key)
-
-        payload = deepcopy(event)
-        return payload
-
-    def _make_idempotency_key(self, event: Dict[str, Any]) -> str:
-        event_type = event.get("event_type")
-
-        if event_type in {"ACTION_START", "ACTION_END", "ZONE_RISK_SCORE", "HYGIENE_EVENT", "SANITARY_EVENT"}:
-            stable = {
-                "event_type": event_type,
-                "action_id": event.get("action_id"),
-                "sanitary_code": event.get("sanitary_code"),
-                "timestamp_start": event.get("timestamp_start"),
-                "timestamp_end": event.get("timestamp_end"),
-                "score": event.get("score"),
-                "level": event.get("level"),
-            }
-        elif event_type == "ACTION_INTERRUPTION":
-            stable = {
-                "event_type": event_type,
-                "interrupted_action_id": event.get("interrupted_action_id"),
-                "resumed_action_id": event.get("resumed_action_id"),
-            }
+        if score == 0 and not cfg["emit_zero_risk_score"]:
+            return []
+        if score < cfg["level_info_lt"]:
+            level = "info"
+        elif score < cfg["level_warning_lt"]:
+            level = "warning"
         else:
-            stable = event
+            level = "violation"
+        if level == "violation" and self._unestablished(entry["employee_confidence"], entry["attribution"]):
+            level = "warning"
+        return self._ship(self._process_payload(
+            "ZONE_RISK_SCORE", entry["employee_id"], entry["zone_id"], entry["camera_id"], entry["ts"],
+            {"action_id": entry["action_id"], "score": score, "level": level, "factors": factors},
+        ))
 
-        return json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str)
+    def _on_sanitary(self, event: Dict) -> List[Dict[str, Any]]:
+        p = event.get("payload") or {}
+        stype = p.get("sanitary_event_type")
+        decision = self._decision(p)
+        ts = _ms(event.get("timestamp"))
 
-    # ==========================================================
-    # ====================== STATE HELPERS ======================
-    # ==========================================================
-    def _new_action_state(self, action_id: str) -> Dict[str, Any]:
-        return {
-            "action_id": action_id,
-            "action_start": None,
-            "action_end": None,
-            "hygiene": None,
-            "hygiene_events": [],
-            "sanitary_events": [],
-            "camera_id": None,
-            "zone_id": None,
-            "employee_id": None,
-            "action_type": None,
-            "timestamp_start": None,
-            "timestamp_end": None,
-            "end_reason": None,
-            "employee_confidence": 0.0,
-            "carrying_tool": False,
-            "carrying_food": False,
-            "updated_at_monotonic": time.time(),
+        if decision == "UNRESOLVED_DUE_TO_DATA_QUALITY":
+            return self._unresolved_to_data_quality(event, p, ts)
+        if decision != "SANITARY_VIOLATION_CONFIRMED":
+            self._suppress(event, decision)
+            return []
+
+        if stype == "intrusion_work_zone":
+            self._register_intrusion(ts, p.get("zone_id"), event.get("camera_id"))
+
+        employee_id = _employee_of(event, p)
+        key = (stype, employee_id or event.get("track_lineage_id") or event.get("entity_id"), p.get("zone_id"))
+        last = self._violation_last.get(key)
+        if last is not None and ts - last < self.cfg["T_violation_dedup_sec"] * 1000:
+            self.stats["suppressed_violation_dedup"] += 1
+            return []
+
+        severity, internal, escalation, original = self._severity(event, p, stype)
+        raw = self._provenance(event)
+        if original:
+            raw["severity_internal_original"] = original
+        payload = {
+            "event_type": "SANITARY_EVENT",
+            "sanitary_event_id": p.get("sanitary_event_id") or event.get("event_id") or str(uuid.uuid4()),
+            "sanitary_event_type": stype,
+            "source_context": p.get("source_context"),
+            "target_context": p.get("target_context"),
+            "severity": severity,
+            "severity_internal": internal,
+            "escalation_category": escalation,
+            "incompatibility_cause": p.get("incompatibility_cause"),
+            "rule_id": str(p["rule_id"]) if p.get("rule_id") is not None else None,
+            "zone_id": p.get("zone_id"),
+            "employee_id": employee_id,
+            "decision_mode": decision,
+            "camera_id": event.get("camera_id"),
+            "timestamp": ts,
+            "raw_payload": raw,
         }
+        out = self._ship(payload)
+        if not out:
+            return out
+        self._violation_last[key] = ts
+        if self.cfg["clip_for_sanitary_violation"]:
+            out += self._clip(event, "sanitary_event_id", payload["sanitary_event_id"])
+        return out
 
-    def _mark_finished(self, action_id: str) -> None:
-        state = self.actions.get(action_id)
-        if state is None:
+    def _severity(self, event: Dict, payload: Dict, stype: Optional[str]):
+        if stype in ESCALATIONS:
+            return "violation", "critical", ESCALATIONS[stype], None
+        internal = str(payload.get("severity_internal") or payload.get("severity") or "warning").lower()
+        confidence = payload.get("employee_confidence", event.get("employee_confidence"))
+        original = None
+        if internal in SEVERITY_CAPPED and self._unestablished(confidence, event.get("executor_attribution")):
+            original, internal = internal, "warning"
+        return SEVERITY_MAP.get(internal, "warning"), internal, None, original
+
+    def _unresolved_to_data_quality(self, event: Dict, payload: Dict, ts: int) -> List[Dict[str, Any]]:
+        return self._ship({
+            "event_type": "DATA_QUALITY_EVENT",
+            "data_quality_event_id": str(uuid.uuid4()),
+            "reason": "unresolved_due_to_data_quality",
+            "employee_id": _employee_of(event, payload),
+            "observation_state": self._obs_state(event, payload),
+            "suppressed_events": [str(payload.get("sanitary_event_id") or event.get("event_id"))],
+            "zone_id": payload.get("zone_id"),
+            "camera_id": event.get("camera_id"),
+            "timestamp": ts,
+            "raw_payload": self._provenance(event),
+        })
+
+    def _register_intrusion(self, ts: int, zone_id, camera_id):
+        self._intrusions.append((ts, zone_id, camera_id))
+        for entry in self._pending_risk:
+            if ts >= entry["ts_from"] and _same_place(zone_id, camera_id, entry["zone_id"], entry["camera_id"]):
+                entry["intrusion"] = True
+
+    def _on_process(self, event: Dict) -> List[Dict[str, Any]]:
+        p = event.get("payload") or {}
+        decision = self._decision(p, "PROCESS_EVENT_CONFIRMED")
+        if decision != "PROCESS_EVENT_CONFIRMED":
+            self._suppress(event, decision)
+            return []
+        raw_type = str(p.get("process_event_type") or "")
+        ptype = PROCESS_TYPES.get(raw_type.lower(), raw_type)
+        employee_id = _employee_of(event, p)
+        if ptype == "food_handoff":
+            self._mark_handoff(event, employee_id)
+        payload = self._process_payload(
+            ptype, employee_id, p.get("zone_id"), event.get("camera_id"),
+            _ms(event.get("timestamp")), p.get("details") or {}, self._provenance(event),
+        )
+        payload["process_event_id"] = p.get("process_event_id") or event.get("event_id") or payload["process_event_id"]
+        out = self._ship(payload)
+        if out and self.cfg["clip_for_process_event"]:
+            out += self._clip(event, "process_event_id", payload["process_event_id"])
+        return out
+
+    def _mark_handoff(self, event: Dict, employee_id: Optional[str]):
+        lineage = event.get("track_lineage_id")
+        for entry in self._pending_risk:
+            if entry["carrying_type"] != "food" or entry["camera_id"] != event.get("camera_id"):
+                continue
+            if ((lineage and entry["lineage"] == lineage)
+                    or (employee_id and entry["employee_id"] == employee_id)
+                    or not (lineage or employee_id)):
+                entry["handoff"] = True
+
+    def _on_data_quality(self, event: Dict) -> List[Dict[str, Any]]:
+        p = event.get("payload") or {}
+        decision = self._decision(p, "DATA_QUALITY_EVENT_CONFIRMED")
+        if decision != "DATA_QUALITY_EVENT_CONFIRMED":
+            self._suppress(event, decision)
+            return []
+        observation_state = self._obs_state(event, p)
+        payload = {
+            "event_type": "DATA_QUALITY_EVENT",
+            "data_quality_event_id": p.get("data_quality_event_id") or event.get("event_id") or str(uuid.uuid4()),
+            "reason": p.get("reason"),
+            "action_id": p.get("action_id"),
+            "employee_id": _employee_of(event, p),
+            "observation_state": observation_state,
+            "suppressed_events": [str(x) for x in (p.get("suppressed_events") or [])],
+            "zone_id": p.get("zone_id"),
+            "camera_id": event.get("camera_id"),
+            "timestamp": _ms(event.get("timestamp")),
+            "raw_payload": self._provenance(event),
+        }
+        out = self._ship(payload)
+        if out and observation_state == "OBS_LOST" and self.cfg["clip_for_data_quality_obs_lost"]:
+            out += self._clip(event, "data_quality_event_id", payload["data_quality_event_id"])
+        return out
+
+    def _on_passthrough(self, event: Dict) -> List[Dict[str, Any]]:
+        out_type = PASSTHROUGH[str(event["event_type"]).lower()]
+        payload = dict(event.get("payload") or {})
+        payload["event_type"] = out_type
+        payload.setdefault(ID_FIELD[out_type], event.get("event_id") or str(uuid.uuid4()))
+        payload.setdefault("camera_id", event.get("camera_id"))
+        if out_type != "AUDIT_CLIP":
+            payload.setdefault("raw_payload", self._provenance(event))
+        return self._ship(payload)
+
+    def _gc(self, now: float):
+        if now - self._last_gc < 5.0:
             return
-        self.finished_actions[action_id] = deepcopy(state)
-
-    def _cleanup_old_state(self) -> None:
-        now = time.time()
-
-        expired_finished = [
-            action_id
-            for action_id, state in self.finished_actions.items()
-            if now - float(state.get("updated_at_monotonic", now)) > self.finished_action_ttl_sec
-        ]
-        for action_id in expired_finished:
-            self.finished_actions.pop(action_id, None)
-            self.actions.pop(action_id, None)
-
-        resume_ttl = float(self.config["interruption"]["T_resume_interrupt_sec"])
-        self.pending_left_zone_actions = [
-            item for item in self.pending_left_zone_actions
-            if now - float(item.get("saved_at_monotonic", now)) <= resume_ttl
-        ]
-
-    def _compute_duration_sec(self, state: Dict[str, Any]) -> Optional[float]:
-        ts_start = self._coerce_ts(state.get("timestamp_start"))
-        ts_end = self._coerce_ts(state.get("timestamp_end"))
-        if ts_start is None or ts_end is None:
-            return None
-        return max(0.0, ts_end - ts_start)
-
-    def _has_sanitary_code(self, state: Dict[str, Any], code: str) -> bool:
-        for event in state.get("sanitary_events", []):
-            if event.get("sanitary_code") == code:
-                return True
-            payload = event.get("payload") or {}
-            if payload.get("code") == code:
-                return True
-        return False
-
-    def _sanitary_event_affects_risk(self, event: Dict[str, Any]) -> bool:
-        return event.get("sanitary_code") in {"food_handoff", "intrusion_work_zone"}
-
-    def _coerce_ts(self, value: Any) -> Optional[float]:
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                return float(value)
-            except Exception:
-                pass
-            try:
-                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-            except Exception:
-                return None
-        return None
-
-    def _now_iso(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
-
-    def _deep_merge(self, base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-        for key, value in override.items():
-            if isinstance(value, dict) and isinstance(base.get(key), dict):
-                base[key] = self._deep_merge(base[key], value)
-            else:
-                base[key] = value
-        return base
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    out_queue = queue.Queue(maxsize=32)
-
-    agg = EventAggregator(out_queue=out_queue)
-
-    demo = [
-        {
-            "event_type": "ACTION_START",
-            "action_id": "A1",
-            "employee_id": 12,
-            "zone_id": "cutting_board",
-            "camera_id": "Kitchen_1",
-            "action_type": "cut",
-            "timestamp_start": 100.0,
-        },
-        {
-            "event_type": "ACTION_END",
-            "action_id": "A1",
-            "employee_id": 12,
-            "zone_id": "cutting_board",
-            "camera_id": "Kitchen_1",
-            "action_type": "cut",
-            "timestamp_start": 100.0,
-            "timestamp_end": 104.5,
-            "end_reason": "left_zone",
-            "employee_confidence": 0.91,
-            "carrying_tool": False,
-            "carrying_food": True,
-            "sanitary_events": [
-                {"type": "PROCESS_EVENT", "code": "food_handoff"},
-                {"type": "SANITARY_VIOLATION", "code": "intrusion_work_zone"},
-            ],
-        },
-        {
-            "event_type": "ACTION_START",
-            "action_id": "A2",
-            "employee_id": 12,
-            "zone_id": "cutting_board",
-            "camera_id": "Kitchen_1",
-            "action_type": "cut",
-            "timestamp_start": 120.0,
-        },
-    ]
-
-    for item in demo:
-        agg.process(item)
-
-    for i in range(out_queue.qsize()):
-        pkt = out_queue.get()
-        print(pkt)
+        self._last_gc = now
+        ttl = self.cfg["state_ttl_sec"]
+        resume = self.cfg["T_resume_interrupt_sec"]
+        self._actions = {k: v for k, v in self._actions.items() if now - v["seen"] <= ttl}
+        self._left_zone = {k: v for k, v in self._left_zone.items() if now - v["seen"] <= resume}
+        cutoff = int(time.time() * 1000) - int(ttl * 1000)
+        self._violation_last = {k: v for k, v in self._violation_last.items() if v >= cutoff}
+        while self._intrusions and self._intrusions[0][0] < cutoff:
+            self._intrusions.popleft()

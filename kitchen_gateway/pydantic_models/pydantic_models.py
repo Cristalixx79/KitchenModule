@@ -113,7 +113,7 @@ class ActionEventLn(BaseModel):
     action_id: str
     employee_id: str
     action_type: str
-    object_class: str
+    object_class: str = Field(default='')
     zone_id: str
     duration: float = Field(ge=0.0)
     end_reason: str
@@ -177,7 +177,7 @@ class SanitaryEventLn(BaseModel):
     source_context: str = Field(default='')
     target_context: str = Field(default='')
     severity: str
-    severity_iternal: str = Field(exclude=True)
+    severity_internal: str = Field(exclude=True)
     escalation_category: str = Field(default='')
     incompatibility_cause: str = Field(default='')
     rule_id: str = Field(default='')
@@ -227,15 +227,15 @@ class SanitaryEventLn(BaseModel):
                 "decision_mode must be in FINAL_DECISIONS: {}".format(FINAL_DECISIONS))
 
     @model_validator(mode='after')
-    def map_severity_iternal(self):
-        if self.severity_iternal in SEVERITY_VIOLATION:
+    def map_severity_internal(self):
+        if self.severity_internal in SEVERITY_VIOLATION:
             self.severity = 'violation'
-        elif self.severity_iternal in SEVERITY_VIOLATION:
+        elif self.severity_internal in SEVERITY_VIOLATION:
             self.severity = 'warning'
-        elif self.severity_iternal in SEVERITY_INFO:
+        elif self.severity_internal in SEVERITY_INFO:
             self.severity = 'info'
         else:
-            raise ValueError("Severity_iternal must be in SEVERITY_TYPES: {}".format(SEVERITY_VIOLATION),
+            raise ValueError("Severity_internal must be in SEVERITY_TYPES: {}".format(SEVERITY_VIOLATION),
                              "{}".format(SEVERITY_WARNING), "{}".format(SEVERITY_INFO))
         return self
 
