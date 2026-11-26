@@ -12,16 +12,17 @@ class GatewayWorker(threading.Thread):
         self._in = input_queue
         self._dbi = dbi_client
 
-    def run(self):
+    def run(self) -> None:
         while not self.stop_event.is_set():
             try:
-                payload = self._in.get(timeout=0.5)
+                event = self._in.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
-                self._dbi.send_with_queue(payload)
+                self._dbi.send_with_queue(event)
             except Exception:
-                logger.exception("gateway: failed to send %s", payload.get("event_type"))
+                # Не логируем содержимое события.
+                logger.exception("gateway: failed to enqueue/send event")
 
-    def stop(self):
+    def stop(self) -> None:
         self.stop_event.set()
